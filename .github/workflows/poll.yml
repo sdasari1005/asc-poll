@@ -1,0 +1,28 @@
+name: asc-poll
+
+on:
+  schedule:
+    # Every 10 minutes. GitHub runs scheduled jobs best-effort (may be delayed
+    # under load), which is fine — Apple's data only changes ~hourly.
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}   # allow manual "Run workflow" from the Actions tab
+
+concurrency:
+  group: asc-poll
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    # Playwright's official image ships Chromium + all deps preinstalled, so
+    # the run starts fast (no browser download each time).
+    container:
+      image: mcr.microsoft.com/playwright/python:v1.48.0-jammy
+    steps:
+      - uses: actions/checkout@v4
+      - name: Poll App Store Connect
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python ci_poll.py
