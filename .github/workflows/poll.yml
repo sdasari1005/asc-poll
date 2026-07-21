@@ -17,7 +17,7 @@ jobs:
     # Playwright's official image ships Chromium + all deps preinstalled, so
     # the run starts fast (no browser download each time).
     container:
-      image: mcr.microsoft.com/playwright/python:v1.48.0-jammy
+      image: mcr.microsoft.com/playwright/python:latest
     steps:
       - uses: actions/checkout@v4
       - name: Poll App Store Connect
