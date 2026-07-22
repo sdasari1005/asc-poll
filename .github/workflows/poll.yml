@@ -14,12 +14,15 @@ concurrency:
 jobs:
   poll:
     runs-on: ubuntu-latest
-    # Playwright's official image ships Chromium + all deps preinstalled, so
-    # the run starts fast (no browser download each time).
-    container:
-      image: mcr.microsoft.com/playwright/python:latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Playwright + Chromium
+        run: |
+          pip install playwright
+          python -m playwright install --with-deps chromium
       - name: Poll App Store Connect
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
