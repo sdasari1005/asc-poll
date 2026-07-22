@@ -172,10 +172,15 @@ def main():
         return
     cache, kv_cookies = scrape(json.loads(cookies_raw))
     if cache is None:
-        tg_send("⚠️ <b>App Store session expired</b> — the cloud poller can't fetch. "
-                "Reply here with fresh cookies (DevTools → Application → Cookies → ⌘A → ⌘C).")
+        # Alert AT MOST ONCE per outage (flag in KV), never every cycle.
+        if not kv_get("session_alert_flag"):
+            tg_send("⚠️ <b>App Store session expired</b> — the cloud poller can't fetch. "
+                    "Reply here with fresh cookies (DevTools → Application → Cookies → ⌘A → ⌘C). "
+                    "You won't be reminded again until it's fixed.")
+            kv_put("session_alert_flag", "1")
         return
 
+    kv_put("session_alert_flag", "")  # session healthy → clear the outage flag
     kv_put("scrape_cache", json.dumps(cache))
     kv_put("session_cookies", json.dumps(kv_cookies))
 
