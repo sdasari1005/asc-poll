@@ -2,8 +2,8 @@ name: asc-poll
 
 on:
   schedule:
-    # Every 10 minutes. GitHub runs scheduled jobs best-effort (may be delayed
-    # under load), which is fine — Apple's data only changes ~hourly.
+    # Hourly (:05 past the hour). Apple's stats update ~hourly with a ~2h lag,
+    # so more frequent polling adds no freshness and just churns the session.
     - cron: "5 * * * *"
   workflow_dispatch: {}   # allow manual "Run workflow" from the Actions tab
 
