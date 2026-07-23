@@ -1,19 +1,23 @@
 name: asc-poll
 
 on:
+  # This schedule is only a RELAUNCH trigger for the long-running loop below.
+  # GitHub throttles *scheduling*, but not a job that's already running — so the
+  # loop self-polls every 30 min from the inside (timing we control), and this
+  # cron just needs to fire once every ~5.5h to keep a loop alive, which even a
+  # throttled scheduler manages reliably.
   schedule:
-    # Hourly (:05 past the hour). Apple's stats update ~hourly with a ~2h lag,
-    # so more frequent polling adds no freshness and just churns the session.
-    - cron: "5 * * * *"
+    - cron: "0 * * * *"
   workflow_dispatch: {}   # allow manual "Run workflow" from the Actions tab
 
 concurrency:
   group: asc-poll
-  cancel-in-progress: false
+  cancel-in-progress: false   # let a running loop finish; the next trigger queues and takes over seamlessly
 
 jobs:
   poll:
     runs-on: ubuntu-latest
+    timeout-minutes: 350   # ~5h50m — safely under GitHub's 6h job cap
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -23,9 +27,22 @@ jobs:
         run: |
           pip install playwright
           python -m playwright install --with-deps chromium
-      - name: Poll App Store Connect
+      - name: Poll every 30 min for ~5.5h (precise timing via internal sleep, not GitHub's throttled scheduler)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python ci_poll.py
+        run: |
+          END=$(( $(date +%s) + 19800 ))   # run for 5.5 hours
+          i=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            i=$((i+1))
+            echo "--- poll #$i at $(date -u) ---"
+            python ci_poll.py || echo "iteration failed, continuing"
+            if [ "$(( $(date +%s) + 1800 ))" -lt "$END" ]; then
+              sleep 1800
+            else
+              break
+            fi
+          done
+          echo "loop finished after $i polls; schedule/concurrency relaunches a fresh loop"
