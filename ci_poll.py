@@ -207,9 +207,13 @@ def main():
             new_state[key] = u
     kv_put("sales_state", json.dumps(new_state))
 
-    now_ist = datetime.now(IST).strftime("%-I:%M %p")
+    # "Last sync" footer appended to every message so you always know how
+    # current the data is: when we just fetched from Apple + Apple's own lag.
+    sync_ist = datetime.now(IST).strftime("%b %-d, %-I:%M %p")
+    footer = f"\n\n🕒 Last synced: {sync_ist} IST  (+ Apple's ~2h lag)"
+
     if cold:
-        tg_send(f"✅ {now_ist} IST — cloud poller started. Watching for new downloads.")
+        tg_send(f"✅ Cloud poller started — watching for new downloads.{footer}")
         kv_put("poll_heartbeat_ts", str(time.time()))
         return
     if deltas:
@@ -222,12 +226,12 @@ def main():
             lines.append(f"🕐 {fmt_zones(h)} — +{sum(d for _, d in items)} unit(s)")
             for title, d in items:
                 lines.append(f"    +{d} — {title}")
-        tg_send("\n".join(lines))
+        tg_send("\n".join(lines) + footer)
     else:
         last_hb = kv_get("poll_heartbeat_ts")
         last_hb = float(last_hb) if last_hb else 0
         if time.time() - last_hb >= HEARTBEAT_MIN_GAP:
-            tg_send(f"✅ {now_ist} IST — no new downloads (cloud poller running, last 24h up to date)")
+            tg_send(f"✅ No new downloads — last 24h up to date.{footer}")
             kv_put("poll_heartbeat_ts", str(time.time()))
 
 
