@@ -32,17 +32,4 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          END=$(( $(date +%s) + 19800 ))   # run for 5.5 hours
-          i=0
-          while [ "$(date +%s)" -lt "$END" ]; do
-            i=$((i+1))
-            echo "--- poll #$i at $(date -u) ---"
-            python ci_poll.py || echo "iteration failed, continuing"
-            if [ "$(( $(date +%s) + 1800 ))" -lt "$END" ]; then
-              sleep 1800
-            else
-              break
-            fi
-          done
-          echo "loop finished after $i polls; schedule/concurrency relaunches a fresh loop"
+        run: python ci_poll.py --loop
