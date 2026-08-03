@@ -244,11 +244,31 @@ def process_deltas(cache):
             kv_put("poll_heartbeat_ts", str(time.time()))
 
 
+def esc(s):
+    """Escape for Telegram parse_mode=HTML (app titles may contain & < >)."""
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def send_long(text, limit=3900):
+    """Send text as one message, or split on line boundaries if over Telegram's
+    ~4096-char cap."""
+    buf = ""
+    for ln in text.split("\n"):
+        if buf and len(buf) + len(ln) + 1 > limit:
+            tg_send(buf)
+            buf = ""
+        buf = f"{buf}\n{ln}" if buf else ln
+    if buf:
+        tg_send(buf)
+
+
 def send_refresh_report(cache):
-    """On-demand /update reply: current last-24h by-hour, stamped 'now'."""
+    """On-demand /update reply: current last-24h, laid out neatly — a By-App
+    digest up top, then a By-Hour timeline grouped by IST day."""
     hour = cache["hourScrape"]
     ws, we = last24_window(hour)
-    by_hour = {}
+    per_hour = {}   # hour_iso -> list[(title, units)]
+    per_app = {}    # title -> total units
     total = 0
     for row in hour["units"]["result"]:
         title = row["metadata"][0]["title"] if row["metadata"] else "(unknown)"
@@ -262,22 +282,47 @@ def send_refresh_report(cache):
             u = p.get("units_utc", 0) or 0
             if u <= 0:
                 continue
-            by_hour.setdefault(h, []).append((title, u))
+            per_hour.setdefault(h, []).append((title, u))
+            per_app[title] = per_app.get(title, 0) + u
             total += u
+
     now_ist = datetime.now(IST).strftime("%b %-d, %-I:%M %p")
-    lines = [f"✅ <b>Refreshed</b> — as of {now_ist} IST",
-             f"<b>Last 24h: {total} unit(s)</b>", ""]
-    if not by_hour:
-        lines.append("No sales in the last 24h.")
-    else:
-        lines.append("<b>By Hour</b>")
-        for h in sorted(by_hour):
-            items = sorted(by_hour[h], key=lambda x: -x[1])
-            lines.append(f"🕐 {fmt_zones(h)} — {sum(u for _, u in items)} unit(s)")
-            for title, u in items:
-                lines.append(f"    {u}× — {title}")
-    lines.append("\n<i>(+ Apple's ~2h lag)</i>")
-    tg_send("\n".join(lines))
+    lines = [f"✅ <b>Refreshed</b> · {now_ist} IST"]
+
+    if total == 0:
+        lines.append("\n📊 No sales in the last 24h.")
+        lines.append("\n<i>+ Apple's ~2h lag</i>")
+        send_long("\n".join(lines))
+        return
+
+    lines.append(f"📊 <b>{total} units</b> · {len(per_app)} apps · last 24h")
+
+    # ── By App: quick digest, most units first ──
+    lines.append("\n🏆 <b>By app</b>")
+    for title, u in sorted(per_app.items(), key=lambda x: (-x[1], x[0].lower())):
+        lines.append(f"   <b>{u}×</b>  {esc(title)}")
+
+    # ── By Hour: timeline grouped under each IST day ──
+    lines.append("\n🕐 <b>By hour</b>")
+    cur_day = None
+    for h in sorted(per_hour):
+        d = datetime.fromisoformat(h.replace("Z", "+00:00"))
+        d_ist = d.astimezone(IST)
+        day_label = d_ist.strftime("%a, %b %-d")
+        if day_label != cur_day:
+            cur_day = day_label
+            lines.append(f"\n📅 <b>{day_label}</b>")
+        ist_t = d_ist.strftime("%-I:%M %p")
+        utc_t = d.astimezone(timezone.utc).strftime("%-I:%M %p")
+        items = sorted(per_hour[h], key=lambda x: -x[1])
+        hsum = sum(u for _, u in items)
+        lines.append(f"<b>{ist_t}</b> · {utc_t} UTC — {hsum}")
+        for title, u in items:
+            prefix = f"{u}× " if u > 1 else ""
+            lines.append(f"   • {prefix}{esc(title)}")
+
+    lines.append("\n<i>+ Apple's ~2h lag</i>")
+    send_long("\n".join(lines))
 
 
 def handle_refresh():
