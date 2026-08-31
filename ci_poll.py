@@ -165,32 +165,44 @@ def fmt_zones(h):
     return f"{d.astimezone(IST).strftime('%b %-d, %-I:%M %p')} IST  ({d.astimezone(timezone.utc).strftime('%-I:%M %p')} UTC)"
 
 
-def scrape_and_store():
-    """Scrape ASC and push fresh cache + rotated cookies to KV.
-    Returns the cache dict, or None if the session is dead (alerts once)."""
-    cookies_raw = kv_get("session_cookies")
+# Two accounts = two providers under one Apple ID, each with its own cookie jar,
+# cache, and state keys in KV. Account 2 is skipped silently until its cookies
+# exist (session_cookies_2), so single-account setups are unaffected.
+ACCOUNTS = {
+    "1": {"cookies": "session_cookies",   "cache": "scrape_cache",   "alert": "session_alert_flag",
+          "state": "sales_state",   "hb": "poll_heartbeat_ts",   "label": "Account 1 · Escapade"},
+    "2": {"cookies": "session_cookies_2", "cache": "scrape_cache_2", "alert": "session_alert_flag_2",
+          "state": "sales_state_2", "hb": "poll_heartbeat_ts_2", "label": "Account 2 · Sunny Dasari"},
+}
+
+
+def scrape_and_store(acct="1"):
+    """Scrape one account and push its fresh cache + rotated cookies to KV.
+    Returns the cache dict, or None (no cookies yet, or session dead → alert once)."""
+    cfg = ACCOUNTS[acct]
+    cookies_raw = kv_get(cfg["cookies"])
     if not cookies_raw:
-        print("no session_cookies in KV")
-        return None
+        return None  # account not set up — skip silently
     cache, kv_cookies = scrape(json.loads(cookies_raw))
     if cache is None:
         # Alert AT MOST ONCE per outage (flag in KV), never every cycle.
-        if not kv_get("session_alert_flag"):
-            tg_send("⚠️ <b>App Store session expired</b> — the cloud poller can't fetch. "
-                    "Reply here with fresh cookies (DevTools → Application → Cookies → ⌘A → ⌘C). "
+        if not kv_get(cfg["alert"]):
+            tg_send(f"⚠️ <b>{cfg['label']} — session expired</b> — the poller can't fetch. "
+                    "Reply here with fresh cookies for this account "
+                    "(DevTools → Application → Cookies → ⌘A → ⌘C). "
                     "You won't be reminded again until it's fixed.")
-            kv_put("session_alert_flag", "1")
+            kv_put(cfg["alert"], "1")
         return None
-    kv_put("session_alert_flag", "")  # session healthy → clear the outage flag
-    kv_put("scrape_cache", json.dumps(cache))
-    kv_put("session_cookies", json.dumps(kv_cookies))
+    kv_put(cfg["alert"], "")  # session healthy → clear the outage flag
+    kv_put(cfg["cache"], json.dumps(cache))
+    kv_put(cfg["cookies"], json.dumps(kv_cookies))
     return cache
 
 
-def compute_new_state(cache):
+def compute_new_state(cache, acct="1"):
     """Return (new_state, deltas) for the last-24h window vs stored sales_state."""
     ws, we = last24_window(cache["hourScrape"])
-    state = kv_get("sales_state")
+    state = kv_get(ACCOUNTS[acct]["state"])
     state = json.loads(state) if state else {}
     new_state = {}
     deltas = []
@@ -211,37 +223,39 @@ def compute_new_state(cache):
     return new_state, deltas
 
 
-def process_deltas(cache):
-    """Normal cycle: alert on genuinely new units, else a throttled heartbeat."""
-    cold = kv_get("sales_state") is None
-    new_state, deltas = compute_new_state(cache)
-    kv_put("sales_state", json.dumps(new_state))
+def process_deltas(cache, acct="1"):
+    """Normal cycle for one account: alert on genuinely new units, else (for the
+    primary account only) a throttled heartbeat."""
+    cfg = ACCOUNTS[acct]
+    cold = kv_get(cfg["state"]) is None
+    new_state, deltas = compute_new_state(cache, acct)
+    kv_put(cfg["state"], json.dumps(new_state))
 
-    # "Last sync" footer so you always know how current the data is.
     sync_ist = datetime.now(IST).strftime("%b %-d, %-I:%M %p")
-    footer = f"\n\n🕒 Last synced: {sync_ist} IST  (+ Apple's ~2h lag)"
+    footer = f"\n\n🕒 {sync_ist} IST  (+ Apple's ~2h lag)"
 
     if cold:
-        tg_send(f"✅ Cloud poller started — watching for new downloads.{footer}")
-        kv_put("poll_heartbeat_ts", str(time.time()))
+        # First time we see this account — seed state quietly, announce once.
+        tg_send(f"✅ Now watching <b>{cfg['label']}</b> for new downloads.{footer}")
+        kv_put(cfg["hb"], str(time.time()))
         return
     if deltas:
         by_hour = {}
         for title, h, d in deltas:
             by_hour.setdefault(h, []).append((title, d))
-        lines = ["🆕 <b>New App Store activity</b>"]
+        lines = [f"🆕 <b>New activity · {cfg['label']}</b>"]
         for h in sorted(by_hour):
             items = sorted(by_hour[h], key=lambda x: -x[1])
             lines.append(f"🕐 {fmt_zones(h)} — +{sum(d for _, d in items)} unit(s)")
             for title, d in items:
-                lines.append(f"    +{d} — {title}")
-        tg_send("\n".join(lines) + footer)
-    else:
-        last_hb = kv_get("poll_heartbeat_ts")
+                lines.append(f"    +{d} — {esc(title)}")
+        send_long("\n".join(lines) + footer)
+    elif acct == "1":  # heartbeat only for the primary account, to limit noise
+        last_hb = kv_get(cfg["hb"])
         last_hb = float(last_hb) if last_hb else 0
         if time.time() - last_hb >= HEARTBEAT_MIN_GAP:
             tg_send(f"✅ No new downloads — last 24h up to date.{footer}")
-            kv_put("poll_heartbeat_ts", str(time.time()))
+            kv_put(cfg["hb"], str(time.time()))
 
 
 def esc(s):
@@ -262,9 +276,9 @@ def send_long(text, limit=3900):
         tg_send(buf)
 
 
-def send_refresh_report(cache):
-    """On-demand /update reply: current last-24h, laid out neatly — a By-App
-    digest up top, then a By-Hour timeline grouped by IST day."""
+def render_account_block(label, cache):
+    """One account's last-24h section: By-App digest + By-Hour timeline.
+    Returns (text, total_units)."""
     hour = cache["hourScrape"]
     ws, we = last24_window(hour)
     per_hour = {}   # hour_iso -> list[(title, units)]
@@ -286,24 +300,17 @@ def send_refresh_report(cache):
             per_app[title] = per_app.get(title, 0) + u
             total += u
 
-    now_ist = datetime.now(IST).strftime("%b %-d, %-I:%M %p")
-    lines = [f"✅ <b>Refreshed</b> · {now_ist} IST"]
-
+    lines = [f"━━━━━  <b>{label}</b>  ━━━━━"]
     if total == 0:
-        lines.append("\n📊 No sales in the last 24h.")
-        lines.append("\n<i>+ Apple's ~2h lag</i>")
-        send_long("\n".join(lines))
-        return
+        lines.append("📊 No sales in the last 24h.")
+        return "\n".join(lines), 0
 
     lines.append(f"📊 <b>{total} units</b> · {len(per_app)} apps · last 24h")
-
-    # ── By App: quick digest, most units first ──
-    lines.append("\n🏆 <b>By app</b>")
+    lines.append("🏆 <b>By app</b>")
     for title, u in sorted(per_app.items(), key=lambda x: (-x[1], x[0].lower())):
         lines.append(f"   <b>{u}×</b>  {esc(title)}")
 
-    # ── By Hour: timeline grouped under each IST day ──
-    lines.append("\n🕐 <b>By hour</b>")
+    lines.append("🕐 <b>By hour</b>")
     cur_day = None
     for h in sorted(per_hour):
         d = datetime.fromisoformat(h.replace("Z", "+00:00"))
@@ -311,7 +318,7 @@ def send_refresh_report(cache):
         day_label = d_ist.strftime("%a, %b %-d")
         if day_label != cur_day:
             cur_day = day_label
-            lines.append(f"\n📅 <b>{day_label}</b>")
+            lines.append(f"📅 <b>{day_label}</b>")
         ist_t = d_ist.strftime("%-I:%M %p")
         utc_t = d.astimezone(timezone.utc).strftime("%-I:%M %p")
         items = sorted(per_hour[h], key=lambda x: -x[1])
@@ -320,42 +327,59 @@ def send_refresh_report(cache):
         for title, u in items:
             prefix = f"{u}× " if u > 1 else ""
             lines.append(f"   • {prefix}{esc(title)}")
+    return "\n".join(lines), total
 
-    lines.append("\n<i>+ Apple's ~2h lag</i>")
-    send_long("\n".join(lines))
+
+def send_refresh_report(accounts):
+    """On-demand /update reply. `accounts` = list of (label, cache) — one section
+    per account, stamped 'now'."""
+    now_ist = datetime.now(IST).strftime("%b %-d, %-I:%M %p")
+    parts = [f"✅ <b>Refreshed</b> · {now_ist} IST"]
+    for label, cache in accounts:
+        block, _ = render_account_block(label, cache)
+        parts.append("\n" + block)
+    parts.append("\n<i>+ Apple's ~2h lag</i>")
+    send_long("\n".join(parts))
 
 
 def handle_refresh():
-    """Service an on-demand /update: scrape, post the fresh report, and sync
-    sales_state so the next normal cycle doesn't re-alert the same units."""
-    kv_put("refresh_request", "")   # claim it immediately (avoid double-service)
-    cache = scrape_and_store()
-    if cache is None:
-        tg_send("⚠️ Couldn't refresh — App Store session may have expired.")
+    """Service an on-demand /update: scrape every configured account, post one
+    combined report, and sync each account's sales_state so the next normal
+    cycle doesn't re-alert the same units."""
+    kv_put("refresh_request", "")     # claim both flags immediately
+    kv_put("refresh_request_2", "")
+    accounts = []
+    for acct in ("1", "2"):
+        cache = scrape_and_store(acct)
+        if cache is not None:
+            new_state, _ = compute_new_state(cache, acct)
+            kv_put(ACCOUNTS[acct]["state"], json.dumps(new_state))
+            accounts.append((ACCOUNTS[acct]["label"], cache))
+    if not accounts:
+        tg_send("⚠️ Couldn't refresh — sessions may have expired.")
         return
-    new_state, _ = compute_new_state(cache)
-    kv_put("sales_state", json.dumps(new_state))
-    send_refresh_report(cache)
+    send_refresh_report(accounts)
 
 
 def main():
-    """One normal cycle (scrape + diff/heartbeat). Used by --loop and by hand."""
-    cache = scrape_and_store()
-    if cache is not None:
-        process_deltas(cache)
+    """One normal cycle for every configured account (scrape + diff/heartbeat)."""
+    for acct in ("1", "2"):
+        cache = scrape_and_store(acct)
+        if cache is not None:
+            process_deltas(cache, acct)
 
 
 def loop():
-    """Long-running loop for GitHub Actions. Every ~20s it checks the KV
-    `refresh_request` flag (set by the Worker's /update button) and services it
-    immediately; otherwise it runs a normal cycle every 30 min. Exits after
-    ~5.5h so the workflow's schedule/concurrency relaunches a fresh loop."""
+    """Long-running loop for GitHub Actions. Every ~20s it checks the KV refresh
+    flags (set by the Worker's /update button) and services them immediately;
+    otherwise it runs a normal cycle every 30 min. Exits after ~5.5h so the
+    workflow's schedule/concurrency relaunches a fresh loop."""
     end = time.time() + 19800          # ~5.5 hours (under GitHub's 6h job cap)
     next_scrape = 0.0                  # 0 → force an immediate first scrape
     print("ci_poll loop started", flush=True)
     while time.time() < end:
         try:
-            if kv_get("refresh_request"):          # non-empty → user tapped /update
+            if kv_get("refresh_request") or kv_get("refresh_request_2"):  # /update tapped
                 print("on-demand refresh requested", flush=True)
                 handle_refresh()
                 next_scrape = time.time() + 1800
