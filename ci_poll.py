@@ -276,43 +276,60 @@ def send_long(text, limit=3900):
         tg_send(buf)
 
 
-def render_account_block(label, cache):
-    """One account's last-24h section: By-App digest + By-Hour timeline.
-    Returns (text, total_units)."""
-    hour = cache["hourScrape"]
-    ws, we = last24_window(hour)
-    per_hour = {}   # hour_iso -> list[(title, units)]
-    per_app = {}    # title -> total units
-    total = 0
-    for row in hour["units"]["result"]:
+def collect_measure(data, key, ws, we):
+    """Aggregate one hourly measure by app and hour inside the same window."""
+    by_app = {}
+    by_hour = {}
+    if not data:
+        return by_app, by_hour
+    for row in data["result"]:
         title = row["metadata"][0]["title"] if row["metadata"] else "(unknown)"
-        for p in row["data"]:
-            h = p.get("hour")
+        for point in row["data"]:
+            h = point.get("hour")
             if not h:
                 continue
             t = datetime.fromisoformat(h.replace("Z", "+00:00")).timestamp()
             if ws is None or not (ws <= t <= we):
                 continue
-            u = p.get("units_utc", 0) or 0
-            if u <= 0:
+            value = point.get(key, 0) or 0
+            if not value:
                 continue
-            per_hour.setdefault(h, []).append((title, u))
-            per_app[title] = per_app.get(title, 0) + u
-            total += u
+            by_app[title] = by_app.get(title, 0) + value
+            by_hour.setdefault(h, {})[title] = value
+    return by_app, by_hour
 
-    lines = [f"━━━━━  <b>{label}</b>  ━━━━━"]
-    if total == 0:
-        lines.append("📊 No sales in the last 24h.")
-        return "\n".join(lines), 0
 
-    lines.append(f"📊 <b>{total} units</b> · {len(per_app)} apps · last 24h")
+def render_account_block(label, cache):
+    """Render the complete rolling 24-hour report for one account."""
+    hour = cache["hourScrape"]
+    ws, we = last24_window(hour)
+    units_app, units_hour = collect_measure(hour["units"], "units_utc", ws, we)
+    sales_app, sales_hour = collect_measure(hour.get("sales"), "total_tax_usd_utc", ws, we)
+    proceeds_app, proceeds_hour = collect_measure(hour.get("proceeds"), "Royalty_utc", ws, we)
+    total = sum(units_app.values())
+    total_sales = sum(sales_app.values())
+    total_proceeds = sum(proceeds_app.values())
+
+    lines = [f"━━━━━  <b>{esc(label)}</b>  ━━━━━"]
+    lines.append(
+        f"📊 <b>{total} units</b> · {len(units_app)} apps · last 24h\n"
+        f"💵 Sales: <b>${total_sales:,.2f}</b>\n"
+        f"💰 Proceeds: <b>${total_proceeds:,.2f}</b>"
+    )
     lines.append("🏆 <b>By app</b>")
-    for title, u in sorted(per_app.items(), key=lambda x: (-x[1], x[0].lower())):
-        lines.append(f"   <b>{u}×</b>  {esc(title)}")
+    all_titles = set(units_app) | set(sales_app) | set(proceeds_app)
+    for title in sorted(all_titles, key=lambda x: (-units_app.get(x, 0), x.lower())):
+        units = units_app.get(title, 0)
+        sales = sales_app.get(title, 0)
+        proceeds = proceeds_app.get(title, 0)
+        kind = "💰 Paid" if sales > 0 else "🆓 Free"
+        lines.append(f"   <b>{units}×</b>  {kind} · {esc(title)}")
+        if sales:
+            lines.append(f"       Sales ${sales:,.2f} · Proceeds ${proceeds:,.2f}")
 
     lines.append("🕐 <b>By hour</b>")
     cur_day = None
-    for h in sorted(per_hour):
+    for h in sorted(units_hour):
         d = datetime.fromisoformat(h.replace("Z", "+00:00"))
         d_ist = d.astimezone(IST)
         day_label = d_ist.strftime("%a, %b %-d")
@@ -321,23 +338,92 @@ def render_account_block(label, cache):
             lines.append(f"📅 <b>{day_label}</b>")
         ist_t = d_ist.strftime("%-I:%M %p")
         utc_t = d.astimezone(timezone.utc).strftime("%-I:%M %p")
-        items = sorted(per_hour[h], key=lambda x: -x[1])
+        items = sorted(units_hour[h].items(), key=lambda x: -x[1])
         hsum = sum(u for _, u in items)
-        lines.append(f"<b>{ist_t}</b> · {utc_t} UTC — {hsum}")
-        for title, u in items:
-            prefix = f"{u}× " if u > 1 else ""
+        h_sales = sum(sales_hour.get(h, {}).values())
+        h_proceeds = sum(proceeds_hour.get(h, {}).values())
+        lines.append(
+            f"<b>{ist_t}</b> · {utc_t} UTC — {hsum} units · "
+            f"${h_sales:,.2f} sales · ${h_proceeds:,.2f} proceeds"
+        )
+        for title, units in items:
+            prefix = f"{units}× " if units > 1 else ""
             lines.append(f"   • {prefix}{esc(title)}")
-    return "\n".join(lines), total
+
+    summary = (
+        f"📊 <b>{esc(label)} — Last 24 Hours</b>\n"
+        f"Units: <b>{total}</b> · Sales: <b>${total_sales:,.2f}</b> · "
+        f"Proceeds: <b>${total_proceeds:,.2f}</b>"
+    )
+    chart = {"hours": sorted(units_hour), "values": [sum(units_hour[h].values()) for h in sorted(units_hour)]}
+    return "\n".join(lines), total, summary, chart
+
+
+def quickchart_png(chart):
+    """Render the same rolling-24h units chart used by the Worker."""
+    config = {
+        "type": "line",
+        "data": {"labels": chart["hours"], "datasets": [{
+            "label": "Units", "data": chart["values"], "fill": True,
+            "backgroundColor": "rgba(143,199,242,0.6)", "borderColor": "#0071e3",
+            "pointRadius": 0, "tension": 0.3,
+        }]},
+        "options": {"plugins": {"legend": {"display": False}, "title": {
+            "display": True, "text": "App Store — Units per Hour (Last 24 Hours, UTC)"
+        }}, "scales": {"y": {"beginAtZero": True, "ticks": {"precision": 0}}}},
+    }
+    req = urllib.request.Request(
+        "https://quickchart.io/chart", data=json.dumps({"chart": config, "width": 900, "height": 400}).encode(),
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as response:
+        return response.read()
+
+
+def tg_send_photo(image, caption):
+    boundary = "----ascPollerBoundary"
+    body = b""
+    body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{CHAT}\r\n".encode()
+    body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n{caption}\r\n".encode()
+    body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"parse_mode\"\r\n\r\nHTML\r\n".encode()
+    body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"chart.png\"\r\nContent-Type: image/png\r\n\r\n".encode()
+    body += image + f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{BOT}/sendPhoto", data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    urllib.request.urlopen(req, timeout=30).read()
 
 
 def send_refresh_report(accounts):
-    """On-demand /update reply. `accounts` = list of (label, cache) — one section
-    per account, stamped 'now'."""
+    """On-demand /update reply with a complete report per account."""
     now_ist = datetime.now(IST).strftime("%b %-d, %-I:%M %p")
     parts = [f"✅ <b>Refreshed</b> · {now_ist} IST"]
+    totals = []
     for label, cache in accounts:
-        block, _ = render_account_block(label, cache)
+        block, _, summary, chart = render_account_block(label, cache)
+        hour = cache["hourScrape"]
+        ws, we = last24_window(hour)
+        sales_app, _ = collect_measure(hour.get("sales"), "total_tax_usd_utc", ws, we)
+        proceeds_app, _ = collect_measure(hour.get("proceeds"), "Royalty_utc", ws, we)
+        totals.append((sum(collect_measure(hour["units"], "units_utc", ws, we)[0].values()),
+                       sum(sales_app.values()), sum(proceeds_app.values())))
+        try:
+            tg_send_photo(quickchart_png(chart), summary)
+        except Exception as e:
+            print(f"chart send failed for {label}: {e}", file=sys.stderr, flush=True)
         parts.append("\n" + block)
+    if len(totals) >= 2:
+        combined = tuple(sum(values[i] for values in totals) for i in range(3))
+        fmt = lambda values, money=False: " + ".join(
+            f"${value:,.2f}" if money else f"{int(value)}" for value in values
+        )
+        parts.extend([
+            "\n🏦 <b>Combined — Both Accounts</b>",
+            f"Units: <b>{fmt([v[0] for v in totals])} = {int(combined[0])}</b>",
+            f"Sales: <b>{fmt([v[1] for v in totals], True)} = ${combined[1]:,.2f}</b>",
+            f"Proceeds: <b>{fmt([v[2] for v in totals], True)} = ${combined[2]:,.2f}</b>",
+        ])
     parts.append("\n<i>+ Apple's ~2h lag</i>")
     send_long("\n".join(parts))
 
